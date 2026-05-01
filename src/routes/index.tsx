@@ -51,7 +51,7 @@ function Landing() {
                 Upload a photo. Get an instant quality report in seconds.
               </p>
               <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
-                <Link to="/auth">
+                <Link to="/inspect">
                   <Button size="lg" className="text-base">
                     Start Inspection <ArrowRight className="ml-2 h-4 w-4" />
                   </Button>
@@ -94,7 +94,7 @@ function Landing() {
               <Step n={3} icon={<FileText className="h-7 w-7" />} title="Report" text="Receive a graded report you can save or download." />
             </div>
             <div className="mt-12 text-center">
-              <Link to="/auth">
+              <Link to="/inspect">
                 <Button size="lg">Try It Free <ArrowRight className="ml-2 h-4 w-4" /></Button>
               </Link>
             </div>
