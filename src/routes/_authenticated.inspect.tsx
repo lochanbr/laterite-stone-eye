@@ -4,7 +4,7 @@ import { Loader2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useServerFn } from "@tanstack/react-start";
-import { analyzeStone } from "@/server/ai.functions";
+import { analyzeStone } from "@/ai.functions.server";
 import { UploadZone } from "@/components/site/UploadZone";
 import { ResultsPanel } from "@/components/site/ResultsPanel";
 import { Button } from "@/components/ui/button";
