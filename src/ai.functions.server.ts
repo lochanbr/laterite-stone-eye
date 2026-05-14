@@ -85,6 +85,27 @@ const analysisTool = {
   },
 };
 
+type LovableAIResponse = {
+  choices?: Array<{
+    message?: {
+      tool_calls?: Array<{
+        function?: {
+          arguments?: string;
+        };
+      }>;
+    };
+  }>;
+};
+
+type GoogleAIResponse = {
+  candidates?: Array<{ content?: Array<{ text?: string }> }>;
+  output?: Array<{ content?: Array<{ text?: string }> }>;
+  response?: {
+    content?: Array<{ text?: string }>;
+    output?: Array<{ content?: Array<{ text?: string }> }>;
+  };
+};
+
 function paramShape(description: string) {
   return {
     type: "object",
@@ -98,70 +119,169 @@ function paramShape(description: string) {
   };
 }
 
+function firstText(items: Array<{ text?: string }> | undefined): string | null {
+  if (!items) {
+    return null;
+  }
+
+  return items.find((item) => typeof item.text === "string")?.text ?? items[0]?.text ?? null;
+}
+
+function getGoogleText(response: GoogleAIResponse): string | null {
+  return (
+    firstText(response.candidates?.[0]?.content) ??
+    firstText(response.output?.[0]?.content) ??
+    firstText(response.response?.content) ??
+    firstText(response.response?.output?.[0]?.content)
+  );
+}
+
 export const analyzeStone = createServerFn({ method: "POST" })
   .inputValidator((input) => InputSchema.parse(input))
   .handler(async ({ data }) => {
-    const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
-    if (!LOVABLE_API_KEY) {
-      throw new Error("AI service is not configured.");
+    const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY || import.meta.env.VITE_LOVABLE_API_KEY;
+    const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || import.meta.env.VITE_GOOGLE_API_KEY;
+    if (!LOVABLE_API_KEY && !GOOGLE_API_KEY) {
+      throw new Error(
+        "AI service is not configured. Set LOVABLE_API_KEY or GOOGLE_API_KEY (or VITE_LOVABLE_API_KEY / VITE_GOOGLE_API_KEY).",
+      );
     }
 
     const dataUrl = `data:${data.mimeType};base64,${data.imageBase64}`;
 
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-2.5-pro",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "Analyze this laterite stone sample and submit your assessment." },
-              { type: "image_url", image_url: { url: dataUrl } },
-            ],
+    if (LOVABLE_API_KEY) {
+      const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "google/gemini-2.5-pro",
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: "Analyze this laterite stone sample and submit your assessment.",
+                },
+                {
+                  type: "image_url",
+                  image_url: { url: dataUrl },
+                },
+              ],
+            },
+          ],
+          tools: [analysisTool],
+          tool_choice: {
+            type: "function",
+            function: { name: "submit_laterite_analysis" },
           },
-        ],
-        tools: [analysisTool],
-        tool_choice: { type: "function", function: { name: "submit_laterite_analysis" } },
-      }),
-    });
+        }),
+      });
 
-    if (response.status === 429) {
-      throw new Error("Too many requests right now. Please wait a moment and try again.");
+      if (response.status === 429) {
+        throw new Error("Too many requests right now. Please wait a moment and try again.");
+      }
+      if (response.status === 402) {
+        throw new Error(
+          "AI usage limit reached. Add credits in Lovable Cloud workspace settings to continue.",
+        );
+      }
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        console.error("AI gateway error", response.status, text);
+        throw new Error("The AI service failed to analyze the image. Please try again.");
+      }
+
+      const json = (await response.json()) as LovableAIResponse;
+      const toolCall = json?.choices?.[0]?.message?.tool_calls?.[0];
+      if (!toolCall?.function?.arguments) {
+        console.error("No tool call in AI response", JSON.stringify(json).slice(0, 500));
+        throw new Error("The AI returned an unexpected response. Please try again.");
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(toolCall.function.arguments);
+      } catch {
+        throw new Error("The AI returned malformed data. Please try again.");
+      }
+
+      const result = ResultSchema.safeParse(parsed);
+      if (!result.success) {
+        console.error("AI result schema validation failed", result.error);
+        throw new Error("The AI report did not match the expected format. Please try again.");
+      }
+
+      return result.data;
     }
-    if (response.status === 402) {
-      throw new Error(
-        "AI usage limit reached. Add credits in Lovable Cloud workspace settings to continue.",
-      );
-    }
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta2/models/gemini-2.5-pro:generateMessage?key=${GOOGLE_API_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messages: [
+            {
+              author: "system",
+              content: [
+                {
+                  type: "text",
+                  text: SYSTEM_PROMPT,
+                },
+              ],
+            },
+            {
+              author: "user",
+              content: [
+                {
+                  type: "text",
+                  text: `Analyze this laterite stone sample and submit your assessment as valid JSON only. Use the exact schema keys: grade, colorUniformity, surfaceTexture, visibleCracks, ironContent, weatheringSigns, shapeRegularity, porosityEstimate, summary, recommendations. Do not include any extra text outside the JSON object.`,
+                },
+                {
+                  type: "image",
+                  imageUri: dataUrl,
+                },
+              ],
+            },
+          ],
+          temperature: 0.2,
+          maxOutputTokens: 1200,
+        }),
+      },
+    );
+
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      console.error("AI gateway error", response.status, text);
+      console.error("Google AI error", response.status, text);
       throw new Error("The AI service failed to analyze the image. Please try again.");
     }
 
-    const json: any = await response.json();
-    const toolCall = json?.choices?.[0]?.message?.tool_calls?.[0];
-    if (!toolCall?.function?.arguments) {
-      console.error("No tool call in AI response", JSON.stringify(json).slice(0, 500));
+    const googleResponse = (await response.json()) as GoogleAIResponse;
+    const outputText = getGoogleText(googleResponse);
+
+    if (!outputText) {
+      console.error("No text output from Google AI", JSON.stringify(googleResponse).slice(0, 500));
       throw new Error("The AI returned an unexpected response. Please try again.");
     }
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(toolCall.function.arguments);
-    } catch {
+      parsed = JSON.parse(outputText);
+    } catch (error) {
+      console.error("Failed to parse AI JSON output", error, outputText);
       throw new Error("The AI returned malformed data. Please try again.");
     }
 
     const result = ResultSchema.safeParse(parsed);
     if (!result.success) {
-      console.error("AI result schema validation failed", result.error);
+      console.error("AI result schema validation failed", result.error, outputText);
       throw new Error("The AI report did not match the expected format. Please try again.");
     }
 
