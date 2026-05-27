@@ -67,41 +67,89 @@ function InspectPage() {
 
   const analyze = async () => {
     if (!file) return;
+
+    // Validate file before sending to AI
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      toast.error("❌ Unsupported image format. Please upload a JPG, PNG, or WEBP image.");
+      return;
+    }
+
+    const maxSizeMB = 10;
+    if (file.size > maxSizeMB * 1024 * 1024) {
+      toast.error(`❌ Image too large. Please use an image under ${maxSizeMB} MB.`);
+      return;
+    }
+
     setAnalyzing(true);
     setResult(null);
     try {
       const { base64, mimeType, dataUrl, blob } = await fileToBase64(file);
       setImageDataUrl(dataUrl);
 
-      const ai = await analyzeFn({ data: { imageBase64: base64, mimeType } });
+      const { data: userData } = await supabase.auth.getUser();
+      const userId = userData.user?.id;
+      let ai: AnalysisResult;
+      let uploadPath: string | null = null;
+
+      if (userId) {
+        const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+        uploadPath = `${userId}/${Date.now()}.${ext}`;
+
+        const { error: upErr } = await supabase.storage
+          .from("inspection-images")
+          .upload(uploadPath, blob, { contentType: mimeType, upsert: false });
+
+        if (upErr) {
+          throw new Error("Could not upload the stone image for analysis.");
+        }
+
+        const { data: signedData, error: signedErr } = await supabase.storage
+          .from("inspection-images")
+          .createSignedUrl(uploadPath, 60 * 60);
+
+        if (signedErr || !signedData?.signedUrl) {
+          throw new Error("Could not generate a temporary image URL for analysis.");
+        }
+
+        ai = await analyzeFn({ data: { type: "url", imageUrl: signedData.signedUrl } });
+      } else {
+        ai = await analyzeFn({ data: { type: "base64", imageBase64: base64, mimeType } });
+      }
+
       const now = new Date();
       setResult(ai);
       setCreatedAt(now);
 
       // Save to history
-      const { data: userData } = await supabase.auth.getUser();
-      const userId = userData.user?.id;
-      if (userId) {
-        const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
-        const path = `${userId}/${Date.now()}.${ext}`;
-        const { error: upErr } = await supabase.storage
-          .from("inspection-images")
-          .upload(path, blob, { contentType: mimeType, upsert: false });
-        if (upErr) {
-          console.error(upErr);
-        } else {
-          const { error: insErr } = await supabase.from("inspections").insert({
-            user_id: userId,
-            image_path: path,
-            grade: ai.grade,
-            result: ai as any,
-          });
-          if (insErr) console.error(insErr);
-        }
+      if (userId && uploadPath) {
+        const { error: insErr } = await supabase.from("inspections").insert({
+          user_id: userId,
+          image_path: uploadPath,
+          grade: ai.grade,
+          result: ai as any,
+        });
+        if (insErr) console.error(insErr);
       }
-      toast.success("Analysis complete");
+
+      toast.success("✅ Analysis complete");
     } catch (e: any) {
-      toast.error(e?.message ?? "Something went wrong analyzing the image.");
+      const msg = e?.message ?? "Failed to analyze the image.";
+      // User-friendly error messages
+      if (msg.includes("authentication failed") || msg.includes("Check GOOGLE_API_KEY")) {
+        toast.error("⚠️ AI service is not properly configured. Contact support.");
+      } else if (msg.includes("access denied")) {
+        toast.error("⚠️ AI service access denied. Verify the API key is active.");
+      } else if (msg.includes("rate limit")) {
+        toast.error("⏱️ AI service rate limit reached. Please wait and try again.");
+      } else if (msg.includes("format")) {
+        toast.error(`❌ ${msg}`);
+      } else if (msg.includes("size")) {
+        toast.error(`❌ ${msg}`);
+      } else if (msg.includes("upload")) {
+        toast.error(`⚠️ ${msg}`);
+      } else {
+        toast.error(`Unable to analyze this image. Make sure it's a clear photo of a laterite stone.`);
+      }
     } finally {
       setAnalyzing(false);
     }

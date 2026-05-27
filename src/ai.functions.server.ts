@@ -1,10 +1,17 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-const InputSchema = z.object({
-  imageBase64: z.string().min(100).max(15_000_000), // raw base64 (no data: prefix)
-  mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
-});
+const InputSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("base64"),
+    imageBase64: z.string().min(100).max(15_000_000), // raw base64 (no data: prefix)
+    mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
+  }),
+  z.object({
+    type: z.literal("url"),
+    imageUrl: z.string().url(),
+  }),
+]);
 
 const ParameterSchema = z.object({
   result: z.string(),
@@ -127,7 +134,36 @@ function firstText(items: Array<{ text?: string }> | undefined): string | null {
   return items.find((item) => typeof item.text === "string")?.text ?? items[0]?.text ?? null;
 }
 
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(buffer).toString("base64");
+  }
+
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, Array.prototype.slice.call(slice));
+  }
+
+  if (typeof btoa !== "undefined") return btoa(binary);
+
+  // Fallback - should not normally be needed in serverless environments
+  return Buffer.from(binary, "binary").toString("base64");
+}
+
 function getGoogleText(response: GoogleAIResponse): string | null {
+  // v1beta1/generateContent response format
+  const candidate = response.candidates?.[0];
+  if (candidate?.content && Array.isArray(candidate.content)) {
+    const part = (candidate.content as any)[0];
+    if (part?.parts && Array.isArray(part.parts) && typeof part.parts[0]?.text === "string") {
+      return part.parts[0].text;
+    }
+    if (typeof part?.text === "string") return part.text;
+  }
+  // Fallback for other response formats
   return (
     firstText(response.candidates?.[0]?.content) ??
     firstText(response.output?.[0]?.content) ??
@@ -147,7 +183,26 @@ export const analyzeStone = createServerFn({ method: "POST" })
       );
     }
 
-    const dataUrl = `data:${data.mimeType};base64,${data.imageBase64}`;
+    // For Lovable API, we can use either base64 or URL
+    // For Google API, we must use base64 (it doesn't support external URLs)
+    let imageBase64: string;
+    let mimeType: "image/jpeg" | "image/png" | "image/webp";
+
+    if (data.type === "base64") {
+      imageBase64 = data.imageBase64;
+      mimeType = data.mimeType;
+    } else {
+      // For URL case, Google API needs us to fetch and encode as base64
+      const response = await fetch(data.imageUrl);
+      if (!response.ok) {
+        throw new Error("Could not download the image from URL. Try uploading the image directly.");
+      }
+      const buffer = await response.arrayBuffer();
+      imageBase64 = arrayBufferToBase64(buffer);
+      mimeType = (response.headers.get("content-type") as any) || "image/jpeg";
+    }
+
+    const dataUrl = `data:${mimeType};base64,${imageBase64}`;
 
     if (LOVABLE_API_KEY) {
       const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
@@ -169,7 +224,7 @@ export const analyzeStone = createServerFn({ method: "POST" })
                 },
                 {
                   type: "image_url",
-                  image_url: { url: dataUrl },
+                  image_url: { url: `data:${mimeType};base64,${imageBase64}` },
                 },
               ],
             },
@@ -193,7 +248,23 @@ export const analyzeStone = createServerFn({ method: "POST" })
       if (!response.ok) {
         const text = await response.text().catch(() => "");
         console.error("AI gateway error", response.status, text);
-        throw new Error("The AI service failed to analyze the image. Please try again.");
+        if (response.status === 401) {
+          throw new Error("Lovable AI authentication failed. Check LOVABLE_API_KEY.");
+        }
+        if (response.status === 403) {
+          throw new Error("Lovable AI access denied. Verify your Lovable API key and permissions.");
+        }
+        if (response.status === 429) {
+          throw new Error("Too many requests right now. Please wait a moment and try again.");
+        }
+        if (response.status === 402) {
+          throw new Error(
+            "AI usage limit reached. Add credits in Lovable Cloud workspace settings to continue.",
+          );
+        }
+        throw new Error(
+          `The AI service failed to analyze the image. ${response.status} ${text.slice(0, 200)}`,
+        );
       }
 
       const json = (await response.json()) as LovableAIResponse;
@@ -220,39 +291,40 @@ export const analyzeStone = createServerFn({ method: "POST" })
     }
 
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta2/models/gemini-2.5-pro:generateMessage?key=${GOOGLE_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta1/models/gemini-2.5-pro:generateContent?key=${GOOGLE_API_KEY}`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          messages: [
+          system_instruction: {
+            parts: [
+              {
+                text: SYSTEM_PROMPT,
+              },
+            ],
+          },
+          contents: [
             {
-              author: "system",
-              content: [
+              role: "user",
+              parts: [
                 {
-                  type: "text",
-                  text: SYSTEM_PROMPT,
-                },
-              ],
-            },
-            {
-              author: "user",
-              content: [
-                {
-                  type: "text",
                   text: `Analyze this laterite stone sample and submit your assessment as valid JSON only. Use the exact schema keys: grade, colorUniformity, surfaceTexture, visibleCracks, ironContent, weatheringSigns, shapeRegularity, porosityEstimate, summary, recommendations. Do not include any extra text outside the JSON object.`,
                 },
                 {
-                  type: "image",
-                  imageUri: dataUrl,
+                  inline_data: {
+                    mime_type: mimeType,
+                    data: imageBase64,
+                  },
                 },
               ],
             },
           ],
-          temperature: 0.2,
-          maxOutputTokens: 1200,
+          generation_config: {
+            temperature: 0.2,
+            max_output_tokens: 1200,
+          },
         }),
       },
     );
@@ -260,7 +332,20 @@ export const analyzeStone = createServerFn({ method: "POST" })
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       console.error("Google AI error", response.status, text);
-      throw new Error("The AI service failed to analyze the image. Please try again.");
+      if (response.status === 401) {
+        throw new Error("Google AI authentication failed. Check GOOGLE_API_KEY.");
+      }
+      if (response.status === 403) {
+        throw new Error(
+          "Google AI access denied. Enable Generative AI in Google Cloud and verify your API key.",
+        );
+      }
+      if (response.status === 429) {
+        throw new Error("Google AI rate limit exceeded. Please wait and try again.");
+      }
+      throw new Error(
+        `The AI service failed to analyze the image. ${response.status} ${text.slice(0, 200)}`,
+      );
     }
 
     const googleResponse = (await response.json()) as GoogleAIResponse;
