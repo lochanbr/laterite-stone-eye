@@ -1,15 +1,36 @@
-/** Convert a File to base64 (no data: prefix) and return mime + dataUrl too. */
-export async function fileToBase64(file: File, maxDim = 1600): Promise<{
+export const IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"] as const;
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+export type ImageMimeType = (typeof IMAGE_MIME_TYPES)[number];
+
+export function getImageFileError(file: File): string | null {
+  if (!IMAGE_MIME_TYPES.some((mimeType) => mimeType === file.type)) {
+    return "Please upload a JPG, PNG, or WEBP image.";
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    return "Image must be smaller than 10 MB.";
+  }
+  return null;
+}
+
+export async function fileToBase64(
+  file: File,
+  maxDim = 1600,
+): Promise<{
   base64: string;
-  mimeType: "image/jpeg" | "image/png" | "image/webp";
+  mimeType: ImageMimeType;
   dataUrl: string;
   blob: Blob;
 }> {
-  const mimeType = (["image/jpeg", "image/png", "image/webp"].includes(file.type)
-    ? file.type
-    : "image/jpeg") as "image/jpeg" | "image/png" | "image/webp";
+  const fileError = getImageFileError(file);
+  if (fileError) throw new Error(fileError);
+  if (!Number.isFinite(maxDim) || maxDim <= 0) {
+    throw new Error("Image dimensions must be a positive number.");
+  }
 
-  // Resize large images via canvas to keep payloads small.
+  const mimeType = IMAGE_MIME_TYPES.find((type) => type === file.type);
+  if (!mimeType) throw new Error("Please upload a JPG, PNG, or WEBP image.");
+
   const url = URL.createObjectURL(file);
   try {
     const img = await loadImage(url);
@@ -49,10 +70,16 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-function blobToDataUrl(blob: Blob): Promise<string> {
+export function blobToDataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Failed to read image data."));
+      }
+    };
     reader.onerror = () => reject(new Error("Failed to read image"));
     reader.readAsDataURL(blob);
   });
@@ -60,6 +87,12 @@ function blobToDataUrl(blob: Blob): Promise<string> {
 
 export async function urlToFile(url: string, filename = "sample.jpg"): Promise<File> {
   const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Could not load sample image (${res.status}).`);
+  }
   const blob = await res.blob();
-  return new File([blob], filename, { type: blob.type || "image/jpeg" });
+  const file = new File([blob], filename, { type: blob.type || "image/jpeg" });
+  const fileError = getImageFileError(file);
+  if (fileError) throw new Error(fileError);
+  return file;
 }

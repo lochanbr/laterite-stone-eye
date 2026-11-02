@@ -1,18 +1,34 @@
 import { jsPDF } from "jspdf";
 import type { AnalysisResult } from "@/lib/types";
-import { GRADE_META, PARAMETER_LABELS } from "@/lib/types";
+import { GRADE_META, PARAMETER_KEYS, PARAMETER_LABELS, type ParameterStatus } from "@/lib/types";
 
-const STATUS_LABEL: Record<string, string> = {
+const STATUS_LABEL: Record<ParameterStatus, string> = {
   good: "OK",
   warning: "WARNING",
   bad: "BAD",
 };
 
-export function downloadReportPdf(result: AnalysisResult, imageDataUrl: string | null, createdAt: Date) {
+export function downloadReportPdf(
+  result: AnalysisResult,
+  imageDataUrl: string | null,
+  createdAt: Date,
+) {
   const doc = new jsPDF({ unit: "pt", format: "a4" });
   const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
   const margin = 40;
+  const bottom = pageHeight - margin;
   let y = margin;
+  const writeLines = (lines: string[]) => {
+    for (const line of lines) {
+      if (y + 13 > bottom) {
+        doc.addPage();
+        y = margin;
+      }
+      doc.text(line, margin, y);
+      y += 13;
+    }
+  };
 
   // Header
   doc.setFillColor(26, 26, 26);
@@ -74,23 +90,37 @@ export function downloadReportPdf(result: AnalysisResult, imageDataUrl: string |
 
   doc.setFontSize(10);
   doc.setFont("helvetica", "normal");
-  for (const [key, label] of Object.entries(PARAMETER_LABELS)) {
-    const param = (result as any)[key] as { result: string; status: string };
+  for (const key of PARAMETER_KEYS) {
+    const param = result[key];
+    const label = PARAMETER_LABELS[key];
+    const resultLines = doc.splitTextToSize(param.result, 220);
+    if (y + Math.max(22, resultLines.length * 13) > bottom) {
+      doc.addPage();
+      y = margin;
+    }
     doc.setTextColor(26, 26, 26);
     doc.setFont("helvetica", "bold");
     doc.text(label, margin, y);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(60, 60, 60);
-    doc.text(param.result, margin + 160, y, { maxWidth: 240 });
+    doc.text(resultLines, margin + 160, y);
     const statusColor: [number, number, number] =
-      param.status === "good" ? [76, 175, 80] : param.status === "warning" ? [255, 152, 0] : [220, 53, 69];
+      param.status === "good"
+        ? [76, 175, 80]
+        : param.status === "warning"
+          ? [255, 152, 0]
+          : [220, 53, 69];
     doc.setTextColor(...statusColor);
     doc.setFont("helvetica", "bold");
     doc.text(STATUS_LABEL[param.status] ?? param.status, pageWidth - margin, y, { align: "right" });
-    y += 22;
+    y += Math.max(22, resultLines.length * 13);
   }
 
   y += 10;
+  if (y + 30 > bottom) {
+    doc.addPage();
+    y = margin;
+  }
   doc.setTextColor(26, 26, 26);
   doc.setFontSize(14);
   doc.setFont("helvetica", "bold");
@@ -100,9 +130,13 @@ export function downloadReportPdf(result: AnalysisResult, imageDataUrl: string |
   doc.setFont("helvetica", "normal");
   doc.setTextColor(60, 60, 60);
   const summaryLines = doc.splitTextToSize(result.summary, pageWidth - margin * 2);
-  doc.text(summaryLines, margin, y);
-  y += summaryLines.length * 13 + 14;
+  writeLines(summaryLines);
+  y += 14;
 
+  if (y + 30 > bottom) {
+    doc.addPage();
+    y = margin;
+  }
   doc.setTextColor(26, 26, 26);
   doc.setFontSize(14);
   doc.setFont("helvetica", "bold");
@@ -113,12 +147,8 @@ export function downloadReportPdf(result: AnalysisResult, imageDataUrl: string |
   doc.setTextColor(60, 60, 60);
   for (const rec of result.recommendations) {
     const lines = doc.splitTextToSize(`• ${rec}`, pageWidth - margin * 2);
-    if (y + lines.length * 13 > doc.internal.pageSize.getHeight() - margin) {
-      doc.addPage();
-      y = margin;
-    }
-    doc.text(lines, margin, y);
-    y += lines.length * 13 + 4;
+    writeLines(lines);
+    y += 4;
   }
 
   doc.save(`lateriteiq-report-${createdAt.toISOString().slice(0, 10)}.pdf`);

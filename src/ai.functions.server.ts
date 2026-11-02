@@ -1,37 +1,12 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
+import { ResultSchema } from "@/lib/analysis-schema";
+export type { AnalysisResult } from "@/lib/types";
 
-const InputSchema = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("base64"),
-    imageBase64: z.string().min(100).max(15_000_000), // raw base64 (no data: prefix)
-    mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
-  }),
-  z.object({
-    type: z.literal("url"),
-    imageUrl: z.string().url(),
-  }),
-]);
-
-const ParameterSchema = z.object({
-  result: z.string(),
-  status: z.enum(["good", "warning", "bad"]),
+const InputSchema = z.object({
+  imageBase64: z.string().min(100).max(15_000_000),
+  mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
 });
-
-export const ResultSchema = z.object({
-  grade: z.enum(["A", "B", "C", "D"]),
-  colorUniformity: ParameterSchema,
-  surfaceTexture: ParameterSchema,
-  visibleCracks: ParameterSchema,
-  ironContent: ParameterSchema,
-  weatheringSigns: ParameterSchema,
-  shapeRegularity: ParameterSchema,
-  porosityEstimate: ParameterSchema,
-  summary: z.string(),
-  recommendations: z.array(z.string()).min(1).max(8),
-});
-
-export type AnalysisResult = z.infer<typeof ResultSchema>;
 
 const SYSTEM_PROMPT = `You are an expert laterite stone quality inspector with deep knowledge of construction materials, mineralogy, and civil engineering applications. Analyze the provided photograph of a laterite stone sample and produce a structured quality assessment.
 
@@ -104,8 +79,10 @@ type LovableAIResponse = {
   }>;
 };
 
+type GoogleAIContent = { text?: string; parts?: Array<{ text?: string }> };
+
 type GoogleAIResponse = {
-  candidates?: Array<{ content?: Array<{ text?: string }> }>;
+  candidates?: Array<{ content?: GoogleAIContent | GoogleAIContent[] }>;
   output?: Array<{ content?: Array<{ text?: string }> }>;
   response?: {
     content?: Array<{ text?: string }>;
@@ -134,38 +111,13 @@ function firstText(items: Array<{ text?: string }> | undefined): string | null {
   return items.find((item) => typeof item.text === "string")?.text ?? items[0]?.text ?? null;
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(buffer).toString("base64");
-  }
-
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const slice = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, Array.prototype.slice.call(slice));
-  }
-
-  if (typeof btoa !== "undefined") return btoa(binary);
-
-  // Fallback - should not normally be needed in serverless environments
-  return Buffer.from(binary, "binary").toString("base64");
-}
-
 function getGoogleText(response: GoogleAIResponse): string | null {
-  // v1beta1/generateContent response format
-  const candidate = response.candidates?.[0];
-  if (candidate?.content && Array.isArray(candidate.content)) {
-    const part = (candidate.content as any)[0];
-    if (part?.parts && Array.isArray(part.parts) && typeof part.parts[0]?.text === "string") {
-      return part.parts[0].text;
-    }
-    if (typeof part?.text === "string") return part.text;
-  }
-  // Fallback for other response formats
+  const content = response.candidates?.[0]?.content;
+  const parts = Array.isArray(content) ? content : content?.parts;
+  const candidateText = firstText(parts) ?? (Array.isArray(content) ? null : content?.text);
+
   return (
-    firstText(response.candidates?.[0]?.content) ??
+    candidateText ??
     firstText(response.output?.[0]?.content) ??
     firstText(response.response?.content) ??
     firstText(response.response?.output?.[0]?.content)
@@ -183,24 +135,7 @@ export const analyzeStone = createServerFn({ method: "POST" })
       );
     }
 
-    // For Lovable API, we can use either base64 or URL
-    // For Google API, we must use base64 (it doesn't support external URLs)
-    let imageBase64: string;
-    let mimeType: "image/jpeg" | "image/png" | "image/webp";
-
-    if (data.type === "base64") {
-      imageBase64 = data.imageBase64;
-      mimeType = data.mimeType;
-    } else {
-      // For URL case, Google API needs us to fetch and encode as base64
-      const response = await fetch(data.imageUrl);
-      if (!response.ok) {
-        throw new Error("Could not download the image from URL. Try uploading the image directly.");
-      }
-      const buffer = await response.arrayBuffer();
-      imageBase64 = arrayBufferToBase64(buffer);
-      mimeType = (response.headers.get("content-type") as any) || "image/jpeg";
-    }
+    const { imageBase64, mimeType } = data;
 
     const dataUrl = `data:${mimeType};base64,${imageBase64}`;
 

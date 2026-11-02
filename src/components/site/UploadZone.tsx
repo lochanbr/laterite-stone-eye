@@ -1,7 +1,8 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState, type KeyboardEvent } from "react";
 import { Camera, ImageIcon, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { getImageFileError } from "@/lib/image";
 
 interface Props {
   file: File | null;
@@ -12,7 +13,6 @@ interface Props {
 }
 
 const ACCEPT = "image/jpeg,image/png,image/webp";
-const MAX_BYTES = 10 * 1024 * 1024;
 
 export function UploadZone({ file, previewUrl, onFile, onUseSample, disabled }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -21,34 +21,56 @@ export function UploadZone({ file, previewUrl, onFile, onUseSample, disabled }: 
 
   const accept = useCallback(
     (f: File | undefined | null) => {
+      if (disabled) return;
       setError(null);
       if (!f) return;
-      if (!["image/jpeg", "image/png", "image/webp"].includes(f.type)) {
-        setError("Please upload a JPG, PNG, or WEBP image.");
-        return;
-      }
-      if (f.size > MAX_BYTES) {
-        setError("Image must be smaller than 10 MB.");
+      const fileError = getImageFileError(f);
+      if (fileError) {
+        setError(fileError);
         return;
       }
       onFile(f);
     },
-    [onFile],
+    [disabled, onFile],
   );
+
+  const openFilePicker = () => {
+    if (!disabled) inputRef.current?.click();
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (disabled || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    openFilePicker();
+  };
 
   if (file && previewUrl) {
     return (
-      <div className="relative overflow-hidden rounded-2xl border border-border bg-card">
-        <img src={previewUrl} alt="Uploaded stone" className="max-h-[420px] w-full object-contain" />
-        {!disabled && (
-          <button
-            type="button"
-            onClick={() => onFile(null)}
-            className="absolute right-3 top-3 rounded-full bg-background/80 p-2 text-foreground backdrop-blur transition hover:bg-background"
-            aria-label="Remove image"
-          >
-            <X className="h-4 w-4" />
-          </button>
+      <div className="space-y-3">
+        <div className="relative overflow-hidden rounded-2xl border border-border bg-card">
+          <img
+            src={previewUrl}
+            alt="Uploaded stone"
+            className="max-h-[420px] w-full object-contain"
+          />
+          {!disabled && (
+            <button
+              type="button"
+              onClick={() => {
+                setError(null);
+                onFile(null);
+              }}
+              className="absolute right-3 top-3 rounded-full bg-background/80 p-2 text-foreground backdrop-blur transition hover:bg-background"
+              aria-label="Remove image"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+        {error && (
+          <p id="upload-error" role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
         )}
       </div>
     );
@@ -58,6 +80,7 @@ export function UploadZone({ file, previewUrl, onFile, onUseSample, disabled }: 
     <div className="space-y-3">
       <div
         onDragOver={(e) => {
+          if (disabled) return;
           e.preventDefault();
           setDrag(true);
         }}
@@ -67,11 +90,15 @@ export function UploadZone({ file, previewUrl, onFile, onUseSample, disabled }: 
           setDrag(false);
           accept(e.dataTransfer.files?.[0]);
         }}
-        onClick={() => inputRef.current?.click()}
+        onClick={openFilePicker}
+        onKeyDown={handleKeyDown}
         role="button"
-        tabIndex={0}
+        aria-disabled={disabled}
+        aria-describedby={error ? "upload-error" : undefined}
+        tabIndex={disabled ? -1 : 0}
         className={cn(
-          "group relative flex min-h-[280px] cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-card/40 p-8 text-center transition",
+          "group relative flex min-h-[280px] flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-card/40 p-8 text-center transition",
+          disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
           drag
             ? "border-primary bg-primary/5 shadow-[0_0_40px_-10px_var(--terracotta-glow)]"
             : "border-border hover:border-primary hover:shadow-[0_0_40px_-15px_var(--terracotta-glow)]",
@@ -82,7 +109,12 @@ export function UploadZone({ file, previewUrl, onFile, onUseSample, disabled }: 
           type="file"
           accept={ACCEPT}
           className="hidden"
-          onChange={(e) => accept(e.target.files?.[0])}
+          disabled={disabled}
+          onClick={(event) => event.stopPropagation()}
+          onChange={(event) => {
+            accept(event.target.files?.[0]);
+            event.currentTarget.value = "";
+          }}
         />
         <div className="rounded-full bg-primary/10 p-4 transition group-hover:bg-primary/20">
           <Camera className="h-10 w-10 text-primary" />
@@ -92,7 +124,11 @@ export function UploadZone({ file, previewUrl, onFile, onUseSample, disabled }: 
           or click to browse — JPG, PNG, WEBP up to 10 MB
         </p>
       </div>
-      {error && <p className="text-sm text-destructive">{error}</p>}
+      {error && (
+        <p id="upload-error" role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
       <div className="flex justify-center">
         <Button variant="outline" size="sm" onClick={onUseSample} disabled={disabled}>
           <ImageIcon className="mr-2 h-4 w-4" /> Use sample image

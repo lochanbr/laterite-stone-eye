@@ -6,6 +6,8 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { ResultsPanel } from "@/components/site/ResultsPanel";
 import type { AnalysisResult } from "@/lib/types";
+import { ResultSchema } from "@/lib/analysis-schema";
+import { blobToDataUrl } from "@/lib/image";
 
 export const Route = createFileRoute("/_authenticated/inspect/$id")({
   head: () => ({
@@ -23,43 +25,69 @@ function InspectionDetail() {
   const [createdAt, setCreatedAt] = useState<Date | null>(null);
 
   useEffect(() => {
-    (async () => {
-      const { data, error } = await supabase
-        .from("inspections")
-        .select("id,created_at,result,image_path")
-        .eq("id", id)
-        .maybeSingle();
-      if (error || !data) {
-        toast.error("Could not load inspection.");
-        setLoading(false);
-        return;
-      }
-      setResult(data.result as unknown as AnalysisResult);
-      setCreatedAt(new Date(data.created_at));
-      const { data: signed } = await supabase.storage
-        .from("inspection-images")
-        .createSignedUrl(data.image_path, 60 * 60);
-      const url = signed?.signedUrl ?? null;
-      setImageUrl(url);
-      // Convert image to data URL for PDF embedding
-      if (url) {
-        try {
-          const res = await fetch(url);
-          const blob = await res.blob();
-          const reader = new FileReader();
-          reader.onload = () => setImageDataUrl(reader.result as string);
-          reader.readAsDataURL(blob);
-        } catch {
-          /* ignore */
+    let cancelled = false;
+    setLoading(true);
+    setResult(null);
+    setImageUrl(null);
+    setImageDataUrl(null);
+    setCreatedAt(null);
+
+    const loadInspection = async () => {
+      try {
+        const { data, error } = await supabase
+          .from("inspections")
+          .select("id,created_at,result,image_path")
+          .eq("id", id)
+          .maybeSingle();
+        if (error || !data) throw new Error("Could not load inspection.");
+
+        const parsedResult = ResultSchema.safeParse(data.result);
+        if (!parsedResult.success) throw new Error("This inspection report contains invalid data.");
+
+        const { data: signed, error: signedError } = await supabase.storage
+          .from("inspection-images")
+          .createSignedUrl(data.image_path, 60 * 60);
+        if (signedError) {
+          toast.error("Report loaded, but its image could not be loaded.");
         }
+
+        const url = signed?.signedUrl ?? null;
+        let dataUrl: string | null = null;
+        if (url) {
+          try {
+            const response = await fetch(url);
+            if (!response.ok) throw new Error(`Image request failed (${response.status}).`);
+            dataUrl = await blobToDataUrl(await response.blob());
+          } catch {
+            toast.error("Report loaded, but its image could not be prepared for the PDF.");
+          }
+        }
+
+        if (cancelled) return;
+        setResult(parsedResult.data);
+        setCreatedAt(new Date(data.created_at));
+        setImageUrl(url);
+        setImageDataUrl(dataUrl);
+      } catch (error: unknown) {
+        if (cancelled) return;
+        toast.error(error instanceof Error ? error.message : "Could not load inspection.");
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-      setLoading(false);
-    })();
+    };
+
+    void loadInspection();
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   return (
     <main className="mx-auto max-w-4xl px-4 py-8 sm:py-12">
-      <Link to="/history" className="mb-6 inline-flex items-center text-sm text-muted-foreground hover:text-foreground">
+      <Link
+        to="/history"
+        className="mb-6 inline-flex items-center text-sm text-muted-foreground hover:text-foreground"
+      >
         <ArrowLeft className="mr-1 h-4 w-4" /> Back to history
       </Link>
 

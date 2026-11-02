@@ -2,7 +2,12 @@ import { motion } from "framer-motion";
 import { Check, AlertTriangle, X, Download } from "lucide-react";
 import { GradeBadge } from "./GradeBadge";
 import { Button } from "@/components/ui/button";
-import { PARAMETER_LABELS, type AnalysisResult, type ParameterStatus } from "@/lib/types";
+import {
+  PARAMETER_KEYS,
+  PARAMETER_LABELS,
+  type AnalysisResult,
+  type ParameterStatus,
+} from "@/lib/types";
 import { downloadReportPdf } from "@/lib/pdf";
 
 const STATUS_ICON: Record<ParameterStatus, React.ReactNode> = {
@@ -50,8 +55,8 @@ export function ResultsPanel({ result, imageDataUrl, createdAt }: Props) {
             <h4 className="font-display text-xl tracking-wide">Quality Parameters</h4>
           </div>
           <ul className="divide-y divide-border">
-            {(Object.keys(PARAMETER_LABELS) as Array<keyof typeof PARAMETER_LABELS>).map((key) => {
-              const param = (result as any)[key] as { result: string; status: ParameterStatus };
+            {PARAMETER_KEYS.map((key) => {
+              const param = result[key];
               return (
                 <li
                   key={key}

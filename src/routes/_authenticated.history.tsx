@@ -1,11 +1,12 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
-import { Trash2, Camera } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Trash2, Camera, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { GradeBadge } from "@/components/site/GradeBadge";
 import type { Grade } from "@/lib/types";
+import type { Tables } from "@/integrations/supabase/types";
 
 export const Route = createFileRoute("/_authenticated/history")({
   head: () => ({
@@ -17,53 +18,80 @@ export const Route = createFileRoute("/_authenticated/history")({
   component: HistoryPage,
 });
 
-interface Row {
-  id: string;
-  created_at: string;
-  grade: Grade;
-  image_path: string;
-  result: { summary?: string };
-  thumbUrl?: string;
-}
+type Inspection = Pick<
+  Tables<"inspections">,
+  "id" | "created_at" | "grade" | "image_path" | "result"
+>;
+type Row = Inspection & { grade: Grade; thumbUrl: string | null };
 
 function HistoryPage() {
   const [rows, setRows] = useState<Row[] | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const load = async () => {
-    const { data, error } = await supabase
-      .from("inspections")
-      .select("id,created_at,grade,image_path,result")
-      .order("created_at", { ascending: false });
-    if (error) {
-      toast.error(error.message);
+  const load = useCallback(async () => {
+    setRows(null);
+    setLoadError(false);
+    try {
+      const { data, error } = await supabase
+        .from("inspections")
+        .select("id,created_at,grade,image_path,result")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+
+      const validRows = (data ?? []).filter((row): row is typeof row & { grade: Grade } =>
+        isGrade(row.grade),
+      );
+      if (validRows.length !== (data ?? []).length) {
+        toast.error("Some inspection records contain an invalid grade and were skipped.");
+      }
+
+      let thumbnailFailures = 0;
+      const withThumbs = await Promise.all(
+        validRows.map(async (row): Promise<Row> => {
+          const { data: signed, error: signedError } = await supabase.storage
+            .from("inspection-images")
+            .createSignedUrl(row.image_path, 60 * 60);
+          if (signedError) thumbnailFailures += 1;
+          return { ...row, thumbUrl: signed?.signedUrl ?? null };
+        }),
+      );
+      if (thumbnailFailures > 0) {
+        toast.error(`${thumbnailFailures} inspection image(s) could not be loaded.`);
+      }
+      setRows(withThumbs);
+    } catch {
+      setLoadError(true);
       setRows([]);
-      return;
+      toast.error("Could not load inspection history. Please try again.");
     }
-    const withThumbs = await Promise.all(
-      (data ?? []).map(async (r: any) => {
-        const { data: signed } = await supabase.storage
-          .from("inspection-images")
-          .createSignedUrl(r.image_path, 60 * 60);
-        return { ...r, thumbUrl: signed?.signedUrl } as Row;
-      }),
-    );
-    setRows(withThumbs);
-  };
+  }, []);
 
   useEffect(() => {
-    load();
-  }, []);
+    void load();
+  }, [load]);
 
   const remove = async (row: Row) => {
     if (!confirm("Delete this inspection?")) return;
-    await supabase.storage.from("inspection-images").remove([row.image_path]);
-    const { error } = await supabase.from("inspections").delete().eq("id", row.id);
-    if (error) {
-      toast.error(error.message);
-      return;
+    setDeletingId(row.id);
+    try {
+      const { error } = await supabase.from("inspections").delete().eq("id", row.id);
+      if (error) throw error;
+
+      setRows((current) => current?.filter((item) => item.id !== row.id) ?? null);
+      const { error: storageError } = await supabase.storage
+        .from("inspection-images")
+        .remove([row.image_path]);
+      if (storageError) {
+        toast.error("Inspection deleted, but its image could not be removed from storage.");
+      } else {
+        toast.success("Inspection deleted");
+      }
+    } catch {
+      toast.error("Could not delete this inspection. Please try again.");
+    } finally {
+      setDeletingId(null);
     }
-    setRows((r) => r?.filter((x) => x.id !== row.id) ?? null);
-    toast.success("Inspection deleted");
   };
 
   return (
@@ -88,7 +116,16 @@ function HistoryPage() {
         </div>
       )}
 
-      {rows && rows.length === 0 && (
+      {loadError && (
+        <div className="rounded-2xl border border-border bg-card p-8 text-center">
+          <p>Inspection history could not be loaded.</p>
+          <Button variant="outline" className="mt-4" onClick={() => void load()}>
+            <RefreshCw className="mr-2 h-4 w-4" /> Try again
+          </Button>
+        </div>
+      )}
+
+      {!loadError && rows && rows.length === 0 && (
         <div className="rounded-2xl border border-dashed border-border bg-card/40 p-12 text-center">
           <h3 className="font-display text-2xl tracking-wide">No inspections yet</h3>
           <p className="mt-2 text-sm text-muted-foreground">
@@ -100,7 +137,7 @@ function HistoryPage() {
         </div>
       )}
 
-      {rows && rows.length > 0 && (
+      {!loadError && rows && rows.length > 0 && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {rows.map((r) => (
             <div
@@ -125,7 +162,7 @@ function HistoryPage() {
                     {new Date(r.created_at).toLocaleString()}
                   </div>
                   <p className="mt-2 line-clamp-2 text-sm">
-                    {r.result?.summary ?? "Inspection report"}
+                    {getSummary(r.result) ?? "Inspection report"}
                   </p>
                 </div>
               </Link>
@@ -134,6 +171,7 @@ function HistoryPage() {
                   variant="ghost"
                   size="sm"
                   onClick={() => remove(r)}
+                  disabled={deletingId === r.id}
                   className="text-destructive hover:text-destructive"
                 >
                   <Trash2 className="mr-1 h-4 w-4" /> Delete
@@ -145,4 +183,14 @@ function HistoryPage() {
       )}
     </main>
   );
+}
+
+function isGrade(grade: string): grade is Grade {
+  return grade === "A" || grade === "B" || grade === "C" || grade === "D";
+}
+
+function getSummary(result: Inspection["result"]): string | undefined {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return undefined;
+  const summary = result.summary;
+  return typeof summary === "string" ? summary : undefined;
 }

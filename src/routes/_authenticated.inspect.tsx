@@ -9,7 +9,7 @@ import { UploadZone } from "@/components/site/UploadZone";
 import { ResultsPanel } from "@/components/site/ResultsPanel";
 import { Button } from "@/components/ui/button";
 import type { AnalysisResult } from "@/lib/types";
-import { fileToBase64, urlToFile } from "@/lib/image";
+import { fileToBase64, getImageFileError, urlToFile } from "@/lib/image";
 
 const SAMPLE_URL =
   "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=1200&q=80";
@@ -18,7 +18,10 @@ export const Route = createFileRoute("/_authenticated/inspect")({
   head: () => ({
     meta: [
       { title: "Inspect — LateriteIQ" },
-      { name: "description", content: "Upload a laterite stone photo and get an instant AI quality report." },
+      {
+        name: "description",
+        content: "Upload a laterite stone photo and get an instant AI quality report.",
+      },
     ],
   }),
   component: InspectPage,
@@ -49,6 +52,8 @@ function InspectPage() {
     setFile(f);
     setPreviewUrl(null);
     setResult(null);
+    setCreatedAt(null);
+    setImageDataUrl(null);
     if (f) {
       const url = URL.createObjectURL(f);
       objectUrlRef.current = url;
@@ -66,17 +71,11 @@ function InspectPage() {
   };
 
   const analyze = async () => {
-    if (!file) return;
+    if (!file || analyzing) return;
 
-    // Validate file before sending to AI
-    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
-      toast.error("❌ Unsupported image format. Please upload a JPG, PNG, or WEBP image.");
-      return;
-    }
-
-    const maxSizeMB = 10;
-    if (file.size > maxSizeMB * 1024 * 1024) {
-      toast.error(`❌ Image too large. Please use an image under ${maxSizeMB} MB.`);
+    const fileError = getImageFileError(file);
+    if (fileError) {
+      toast.error(fileError);
       return;
     }
 
@@ -86,69 +85,61 @@ function InspectPage() {
       const { base64, mimeType, dataUrl, blob } = await fileToBase64(file);
       setImageDataUrl(dataUrl);
 
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData, error: userError } = await supabase.auth.getUser();
+      if (userError) throw new Error("Could not verify your account. Please try again.");
       const userId = userData.user?.id;
-      let ai: AnalysisResult;
-      let uploadPath: string | null = null;
-
-      if (userId) {
-        const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
-        uploadPath = `${userId}/${Date.now()}.${ext}`;
-
-        const { error: upErr } = await supabase.storage
-          .from("inspection-images")
-          .upload(uploadPath, blob, { contentType: mimeType, upsert: false });
-
-        if (upErr) {
-          throw new Error("Could not upload the stone image for analysis.");
-        }
-
-        const { data: signedData, error: signedErr } = await supabase.storage
-          .from("inspection-images")
-          .createSignedUrl(uploadPath, 60 * 60);
-
-        if (signedErr || !signedData?.signedUrl) {
-          throw new Error("Could not generate a temporary image URL for analysis.");
-        }
-
-        ai = await analyzeFn({ data: { type: "url", imageUrl: signedData.signedUrl } });
-      } else {
-        ai = await analyzeFn({ data: { type: "base64", imageBase64: base64, mimeType } });
-      }
+      const ai: AnalysisResult = await analyzeFn({ data: { imageBase64: base64, mimeType } });
 
       const now = new Date();
       setResult(ai);
       setCreatedAt(now);
 
-      // Save to history
-      if (userId && uploadPath) {
+      if (userId) {
+        const ext = mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : "jpg";
+        const uploadPath = `${userId}/${Date.now()}.${ext}`;
+        const { error: uploadError } = await supabase.storage
+          .from("inspection-images")
+          .upload(uploadPath, blob, { contentType: mimeType, upsert: false });
+
+        if (uploadError) {
+          toast.error("Analysis complete, but the image could not be saved to your history.");
+          return;
+        }
+
         const { error: insErr } = await supabase.from("inspections").insert({
           user_id: userId,
           image_path: uploadPath,
           grade: ai.grade,
-          result: ai as any,
+          result: JSON.parse(JSON.stringify(ai)),
         });
-        if (insErr) console.error(insErr);
+        if (insErr) {
+          const { error: cleanupError } = await supabase.storage
+            .from("inspection-images")
+            .remove([uploadPath]);
+          toast.error(
+            cleanupError
+              ? "Analysis complete, but saving failed and the uploaded image could not be cleaned up."
+              : "Analysis complete, but the report could not be saved to your history.",
+          );
+          return;
+        }
       }
 
-      toast.success("✅ Analysis complete");
-    } catch (e: any) {
-      const msg = e?.message ?? "Failed to analyze the image.";
-      // User-friendly error messages
+      toast.success(userId ? "Analysis complete and saved to history." : "Analysis complete.");
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : "Failed to analyze the image.";
       if (msg.includes("authentication failed") || msg.includes("Check GOOGLE_API_KEY")) {
-        toast.error("⚠️ AI service is not properly configured. Contact support.");
+        toast.error("AI service is not properly configured. Contact support.");
       } else if (msg.includes("access denied")) {
-        toast.error("⚠️ AI service access denied. Verify the API key is active.");
+        toast.error("AI service access denied. Verify the API key is active.");
       } else if (msg.includes("rate limit")) {
-        toast.error("⏱️ AI service rate limit reached. Please wait and try again.");
-      } else if (msg.includes("format")) {
-        toast.error(`❌ ${msg}`);
-      } else if (msg.includes("size")) {
-        toast.error(`❌ ${msg}`);
-      } else if (msg.includes("upload")) {
-        toast.error(`⚠️ ${msg}`);
+        toast.error("AI service rate limit reached. Please wait and try again.");
+      } else if (msg.includes("account")) {
+        toast.error(msg);
       } else {
-        toast.error(`Unable to analyze this image. Make sure it's a clear photo of a laterite stone.`);
+        toast.error(
+          msg || "Unable to analyze this image. Make sure it's a clear photo of a laterite stone.",
+        );
       }
     } finally {
       setAnalyzing(false);
@@ -173,12 +164,7 @@ function InspectPage() {
             onUseSample={useSample}
             disabled={analyzing}
           />
-          <Button
-            size="lg"
-            className="w-full"
-            disabled={!file || analyzing}
-            onClick={analyze}
-          >
+          <Button size="lg" className="w-full" disabled={!file || analyzing} onClick={analyze}>
             {analyzing ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Analyzing…
@@ -198,9 +184,7 @@ function InspectPage() {
           )}
           {!analyzing && !result && (
             <div className="flex h-full min-h-[280px] items-center justify-center rounded-2xl border border-dashed border-border bg-card/40 p-8 text-center">
-              <p className="text-sm text-muted-foreground">
-                Your quality report will appear here.
-              </p>
+              <p className="text-sm text-muted-foreground">Your quality report will appear here.</p>
             </div>
           )}
         </div>
